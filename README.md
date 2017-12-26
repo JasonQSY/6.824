@@ -10,4 +10,4 @@ This repo follows MIT 6.824, Spring 2017.
 ## Reference
 
 - [MIT 6.824](https://pdos.csail.mit.edu/6.824/index.html)
-
+- [Umich EECS 591](https://web.eecs.umich.edu/~manosk/eecs591-w17.html)
