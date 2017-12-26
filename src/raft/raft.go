@@ -17,13 +17,22 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
 
-
+// constants
+const (
+	STATELEADER = iota
+	STATEFOLLOWER
+	STATECANDIDATE
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -35,6 +44,10 @@ type ApplyMsg struct {
 	Command     interface{}
 	UseSnapshot bool   // ignore for lab2; only used in lab3
 	Snapshot    []byte // ignore for lab2; only used in lab3
+}
+
+type logEntry struct {
+	Command interface{}
 }
 
 //
@@ -50,16 +63,34 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// state
+	state   int
+	voteCnt int
+
+	// chans
+	chanHeartbeat chan bool
+
+	// Persistent state on all servers
+	currentTerm int // latest term server has seen
+	votedFor    int // candidateId that received vote in current term
+	log         []logEntry
+
+	// Volatile state on all servers
+	commitIndex int // index of highest log entry known to be committed.
+	lastApplied int // index of highest log entry applied to state machine.
+
+	// Volatile state on leaders (maintain for all servers, reinitialized after election)
+	isleader   bool
+	nextIndex  []int // index of the next log entry to send to that server
+	matchIndex []int // index of highest log entry known to be replicated on that  server.
+
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.state == STATELEADER
 }
 
 //
@@ -93,15 +124,16 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -110,6 +142,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -117,6 +151,13 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.Term = rf.currentTerm
+	if args.Term == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
 }
 
 //
@@ -150,9 +191,64 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+		}
+		if reply.VoteGranted {
+			rf.voteCnt++
+			if rf.voteCnt > len(rf.peers)/2 {
+				rf.state = STATELEADER
+				rf.votedFor = -1
+				rf.voteCnt = 0
+				rf.currentTerm++
+			}
+		}
+	}
 	return ok
 }
 
+// AppendEntries RPC
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []logEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.LeaderId != rf.me {
+		rf.state = STATEFOLLOWER
+		rf.votedFor = -1
+	}
+	reply.Term = rf.currentTerm
+	reply.Success = true
+	rf.chanHeartbeat <- true
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		if reply.Term > rf.currentTerm {
+			rf.state = STATEFOLLOWER
+			return ok
+		}
+	}
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -173,7 +269,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -207,10 +302,67 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// rf.log = make([]logEntry, Interface{})
+	rf.state = STATEFOLLOWER
+	rf.voteCnt = 0
+	rf.chanHeartbeat = make(chan bool, 100)
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, 0)
+	rf.matchIndex = make([]int, 0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// background subroutine
+	go func() {
+		for {
+			switch rf.state {
+			case STATELEADER:
+				var args AppendEntriesArgs
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				var reply AppendEntriesReply
+				rf.mu.Lock()
+				for i := range rf.peers {
+					go func(i int) {
+						rf.sendAppendEntries(i, &args, &reply)
+					}(i)
+				}
+				rf.mu.Unlock()
+				time.Sleep(120 * time.Millisecond)
+			case STATECANDIDATE:
+				var args RequestVoteArgs
+				rf.mu.Lock()
+				rf.votedFor = rf.me
+				rf.voteCnt = 1
+				args.Term = rf.currentTerm
+				args.CandidateId = rf.me
+				for i := range rf.peers {
+					var reply RequestVoteReply
+					if i != rf.me {
+						go func(i int) {
+							rf.sendRequestVote(i, &args, &reply)
+						}(i)
+					}
+				}
+				rf.mu.Unlock()
+				time.Sleep(120 * time.Millisecond)
+				if rf.state != STATELEADER {
+					rf.state = STATEFOLLOWER
+					rf.votedFor = -1
+				}
+			case STATEFOLLOWER:
+				select {
+				case <-rf.chanHeartbeat:
+				case <-time.After(time.Duration(rand.Int63()%333+550) * time.Millisecond):
+					rf.state = STATECANDIDATE
+				}
+			}
+		}
+	}()
 
 	return rf
 }
